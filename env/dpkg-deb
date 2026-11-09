@@ -1,0 +1,22 @@
+#!/bin/sh
+# dpkg-deb compatibility wrapper (subset: -x, -c, --contents)
+case "${1:-}" in
+    -x|--extract)
+        shift
+        sh "$APPDIR/bin/dpkg" -x "$1" "$2"
+exit $?
+        ;;
+    -c|--contents)
+        shift
+        sh "$APPDIR/bin/dpkg" --contents "$1"
+exit $?
+        ;;
+    -b|--build)
+        echo "dpkg-deb: use mkdeb <name> <version> <payload-dir> [arch]" >&2
+        exit 2
+        ;;
+    *)
+        echo "usage: dpkg-deb -x <deb> <dir> | -c <deb> | (use mkdeb to build)" >&2
+        exit 2
+        ;;
+esac

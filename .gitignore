@@ -1,0 +1,16 @@
+# Local build inputs
+work/
+build/
+package/
+testapp/
+cert/
+*.ipa
+*.p12
+*.mobileprovision
+*.tar.gz
+*.log
+signing/
+
+# Research inputs
+neofetch-script
+a-Shell*.ipa

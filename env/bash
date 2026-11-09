@@ -1,0 +1,38 @@
+#!/bin/sh
+# bash-compat - a-Shell POSIX sh compatibility launcher.
+#
+# GNU bash is not bundled with Terminal.  This launcher provides the common
+# `bash script` / `bash -c 'command'` interface on top of a-Shell's sh so
+# simple plugin scripts work.  If a real bash is installed at
+# $PREFIX/bin/bash, the prefix PATH takes precedence over this launcher.
+
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-version" ]; then
+    echo "bash-compat 1.0 (a-Shell POSIX sh; GNU bash is not bundled)"
+    exit 0
+fi
+
+if [ "${1:-}" = "-c" ]; then
+    shift
+    if [ $# -eq 0 ]; then
+        echo "bash-compat: -c requires a command" >&2
+        exit 2
+    fi
+    command="$1"
+    shift
+    sh -c "$command" "$@" 
+    exit $?
+fi
+
+if [ $# -gt 0 ] && [ -f "$1" ]; then
+    sh "$@"
+    exit $?
+fi
+
+if [ $# -eq 0 ]; then
+    echo "bash-compat: a-Shell POSIX sh.  GNU bash-specific syntax is not supported." >&2
+    sh -s
+    exit $?
+fi
+
+sh "$@"
+exit $?

@@ -1,0 +1,316 @@
+#!/bin/sh
+# apt - native Terminal package front-end (Terminal-compatible .deb packages)
+# This is not Debian apt: it manages packages built for iOS/Terminal.
+
+ROOT="${TERM_ROOT:-$HOME/Documents/.terminal}"
+LISTS="$ROOT/var/lib/apt/lists"
+INDEX="$LISTS/Packages"
+CACHE="$ROOT/var/cache/apt/archives"
+SOURCES="$ROOT/etc/apt/sources.list"
+VISITED=""
+DPKG="${APPDIR:-}/bin/dpkg"
+[ -f "$DPKG" ] || DPKG="dpkg"
+
+usage() {
+    printf '%s\n' "Usage: apt <command>"
+    printf '%s\n' ""
+    printf '%s\n' "  update                  Refresh package indexes"
+    printf '%s\n' "  search <text>           Search package names/descriptions"
+    printf '%s\n' "  show <package>          Show package details"
+    printf '%s\n' "  install <package|deb>   Install a package (dependencies are resolved locally)"
+    printf '%s\n' "  remove|purge <package>  Remove a package"
+    printf '%s\n' "  list --installed        List installed packages"
+    printf '%s\n' "  list                    List packages in the current index"
+    printf '%s\n' "  clean                   Clear downloaded archives"
+    printf '%s\n' "  --version               Show version"
+    printf '%s\n' ""
+    printf '%s\n' "Default repository: file://$ROOT/repo"
+    printf '%s\n' "Create packages with: mkdeb <name> <version> <payload-dir> [arch]"
+}
+ensure() {
+    mkdir -p "$ROOT" "$LISTS" "$CACHE" "$ROOT/var/lib/dpkg" "$ROOT/tmp"
+    [ -f "$ROOT/var/lib/dpkg/status" ] || : > "$ROOT/var/lib/dpkg/status"
+}
+
+field() {
+    key="$1"; stanza="$2"
+    tmp="$ROOT/tmp/field.$$"
+    printf '%s\n' "$stanza" > "$tmp"
+    awk -v key="$key" 'index($0,key": ")==1 { sub("^" key ": ",""); print; exit }' "$tmp"
+    rm -f "$tmp"
+}
+
+find_stanza() {
+    local pkg="$1"
+    [ -f "$INDEX" ] || return 0
+    awk -v pkg="$pkg" 'BEGIN{RS=""; ORS="\n\n"} $0 ~ "(^|\\n)Package: " pkg "(\\n|$)" { print; exit }' "$INDEX"
+}
+
+is_installed() {
+    out="$ROOT/tmp/dpkg-status.$$"
+    sh "$DPKG" -s "$1" > "$out" 2>/dev/null
+    grep -q '^Status: install ok installed' "$out"
+    result=$?
+    rm -f "$out"
+    return $result
+}
+
+decompress_index() {
+    file="$1"
+    out="$2"
+    case "$file" in
+        *.xz)
+            xz -d -c "$file" >> "$out" 2>/dev/null || python3 -c 'import lzma,sys; sys.stdout.buffer.write(lzma.open(sys.argv[1],"rb").read())' "$file" >> "$out" 2>/dev/null
+            ;;
+        *.gz)
+            gzip -dc "$file" >> "$out" 2>/dev/null || python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.open(sys.argv[1],"rb").read())' "$file" >> "$out" 2>/dev/null
+            ;;
+        *)
+            cat "$file" >> "$out"
+            ;;
+    esac
+}
+
+fetch_index() {
+    URI="$1"
+    TMPIDX="$ROOT/tmp/index.$$"
+    rm -f "$TMPIDX" "$TMPIDX.xz" "$TMPIDX.gz"
+    case "$URI" in
+        file://*)
+            DIR="${URI#file://}"
+            for name in Packages Packages.xz Packages.gz; do
+                if [ -f "$DIR/$name" ]; then
+                    decompress_index "$DIR/$name" "$INDEX"
+                    return 0
+                fi
+            done
+            ;;
+        http://*|https://*)
+            if curl -L --fail --silent --connect-timeout 10 --max-time 120 "$URI/Packages.xz" -o "$TMPIDX.xz" 2>/dev/null; then
+                decompress_index "$TMPIDX.xz" "$INDEX"
+                rm -f "$TMPIDX.xz"
+                return 0
+            fi
+            if curl -L --fail --silent --connect-timeout 10 --max-time 120 "$URI/Packages.gz" -o "$TMPIDX.gz" 2>/dev/null; then
+                decompress_index "$TMPIDX.gz" "$INDEX"
+                rm -f "$TMPIDX.gz"
+                return 0
+            fi
+            if curl -L --fail --silent --connect-timeout 10 --max-time 120 "$URI/Packages" -o "$TMPIDX" 2>/dev/null; then
+                cat "$TMPIDX" >> "$INDEX"
+                rm -f "$TMPIDX"
+                return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
+update_lists() {
+    ensure
+    echo "apt: updating package lists..."
+    : > "$INDEX"
+    if [ ! -f "$SOURCES" ]; then
+        mkdir -p "$(dirname "$SOURCES")"
+        printf 'deb [trusted=yes] file://%s/repo ./\n' "$ROOT" > "$SOURCES"
+    fi
+    n=1
+    while [ $n -le 8 ]; do
+        LINE=$(awk -v want="$n" '/^deb /{ count++; if (count == want) { print; exit } }' "$SOURCES")
+        [ -n "$LINE" ] || break
+        set -- $LINE
+        if [ "${2:-}" = "[trusted=yes]" ]; then
+            URI="${3:-}"; SUITE="${4:-./}"
+        else
+            URI="${2:-}"; SUITE="${3:-./}"
+        fi
+        if [ -n "$URI" ]; then
+            case "$URI" in
+                http://*|https://*)
+                    if [ "${APT_SKIP_REMOTE:-0}" = "1" ]; then
+                        echo "Ign:$n $URI (remote skipped)"
+                        n=$((n + 1))
+                        continue
+                    fi
+                    ;;
+            esac
+            if fetch_index "$URI"; then
+                echo "Get:$n $URI $SUITE"
+            else
+                echo "Err:$n $URI (no index / unreachable)" >&2
+            fi
+        fi
+        n=$((n + 1))
+    done
+    echo "Reading package lists... Done"
+}
+
+search_packages() {
+    text="${1:-}"
+    ensure
+    [ -f "$INDEX" ] || { echo "E: Run 'apt update' first" >&2; return 1; }
+    awk -v pat="$text" 'BEGIN{RS="";FS="\n"} {
+        if (pat == "" || tolower($0) ~ tolower(pat)) {
+            p=""; v=""; d="";
+            for (i=1;i<=NF;i++) {
+                if ($i ~ /^Package: /) p=substr($i,10);
+                if ($i ~ /^Version: /) v=substr($i,10);
+                if ($i ~ /^Description: /) d=substr($i,14);
+            }
+            if (p != "") printf "%-28s %-16s %s\n", p, v, d;
+        }
+    }' "$INDEX"
+}
+
+show_package() {
+    pkg="${1:-}"
+    ensure
+    stanza=$(find_stanza "$pkg")
+    if [ -z "$stanza" ]; then
+        echo "E: Unable to locate package $pkg" >&2
+        return 1
+    fi
+    printf '%s\n' "$stanza"
+}
+
+install_one() {
+    local pkg="$1"
+    local stanza version depends dep filename local_archive base oldifs
+    [ -n "$pkg" ] || return 0
+    case " $VISITED " in *" $pkg "*) return 0 ;; esac
+    VISITED="$VISITED $pkg"
+    if is_installed "$pkg"; then
+        echo "$pkg is already the newest version."
+        return 0
+    fi
+    stanza=$(find_stanza "$pkg")
+    if [ -z "$stanza" ]; then
+        for localdeb in "$ROOT/repo/pool/${pkg}"_*.deb; do
+            if [ -f "$localdeb" ]; then
+                echo "Installing $pkg from local pool..."
+                sh "$DPKG" -i "$localdeb" || return 1
+                return 0
+            fi
+        done
+        echo "E: Unable to locate package $pkg" >&2
+        return 1
+    fi
+    version=$(field Version "$stanza")
+    depends=$(field Depends "$stanza")
+    if [ -n "$depends" ]; then
+        oldifs="$IFS"
+        IFS=','
+        for dep in $depends; do
+            IFS="$oldifs"
+            dep=${dep%%|*}
+            dep=${dep%%(*}
+            dep=$(echo "$dep" | tr -d ' ')
+            dep=${dep%:any}
+            [ -n "$dep" ] || continue
+            if ! is_installed "$dep"; then
+                if [ -n "$(find_stanza "$dep")" ]; then
+                    echo "Installing dependency: $dep"
+                    install_one "$dep" || return 1
+                else
+                    echo "W: dependency '$dep' is not in the index" >&2
+                fi
+            fi
+            IFS=','
+        done
+        IFS="$oldifs"
+    fi
+    filename=$(field Filename "$stanza")
+    if [ -z "$filename" ]; then
+        echo "E: package $pkg has no Filename field" >&2
+        return 1
+    fi
+    filename="${filename#./}"
+    local_archive="$CACHE/${pkg}_${version}.deb"
+    if [ -f "$ROOT/repo/$filename" ]; then
+        cp "$ROOT/repo/$filename" "$local_archive" || return 1
+    else
+        fetched=0
+        BASES=$(awk '/^deb /{for(i=1;i<=NF;i++) if($i ~ /^https?:/) print $i}' "$SOURCES")
+        for base in $BASES; do
+            if curl -L --fail --silent --connect-timeout 10 --max-time 180 "$base/$filename" -o "$local_archive" 2>/dev/null; then
+                fetched=1
+                break
+            fi
+        done
+        if [ $fetched -ne 1 ]; then
+            echo "E: cannot fetch $filename" >&2
+            return 1
+        fi
+    fi
+    echo "Installing $pkg ($version)..."
+    echo "apt: invoking dpkg..."
+    sh "$DPKG" -i "$local_archive" || return 1
+    return 0
+}
+
+install_packages() {
+    ensure
+    echo "apt: resolving packages..."
+    [ -f "$INDEX" ] || { echo "E: Run 'apt update' first" >&2; return 1; }
+    status=0
+    for arg in "$@"; do
+        case "$arg" in
+            *.deb)
+                sh "$DPKG" -i "$arg" || status=1
+                ;;
+            *)
+                install_one "$arg" || status=1
+                ;;
+        esac
+    done
+    echo "Done."
+    return $status
+}
+
+remove_packages() {
+    status=0
+    for pkg in "$@"; do
+        sh "$DPKG" -r "$pkg" || status=1
+    done
+    return $status
+}
+
+list_installed() {
+    sh "$DPKG" -l
+}
+
+list_all() {
+    ensure
+    [ -f "$INDEX" ] || { echo "E: Run 'apt update' first" >&2; return 1; }
+    awk 'BEGIN{RS="";FS="\n"} {
+        p="";v="";a="";
+        for(i=1;i<=NF;i++){
+            if($i~/^Package: /)p=substr($i,10);
+            if($i~/^Version: /)v=substr($i,10);
+            if($i~/^Architecture: /)a=substr($i,14);
+        }
+        if(p!="") printf "%-28s %-16s %s\n", p, v, a;
+    }' "$INDEX"
+}
+
+case "${1:-}" in
+    update) update_lists ;;
+    search) shift; search_packages "${1:-}" ;;
+    show) shift; show_package "${1:-}" ;;
+    install) shift; install_packages "$@" ;;
+    remove|uninstall) shift; remove_packages "$@" ;;
+    purge) shift; remove_packages "$@" ;;
+    list)
+        shift
+        if [ "${1:-}" = "--installed" ]; then list_installed; else list_all; fi
+        ;;
+    clean)
+        rm -f "$CACHE"/*.deb
+        echo "Cleaned package archives"
+        ;;
+    --version|-v)
+        echo "apt 1.0 (Terminal native package front-end)"
+        ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+esac

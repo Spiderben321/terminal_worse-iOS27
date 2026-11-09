@@ -1,0 +1,391 @@
+#!/bin/sh
+# dpkg - native Terminal package manager (Debian .deb format subset)
+#
+# Packages must be built for the native Terminal/iOS environment (scripts or
+# iOS/Darwin arm64 binaries).  Debian Linux arm64/amd64 packages are rejected
+# by default because their ELF binaries cannot run on iOS without an emulator.
+
+ROOT="${TERM_ROOT:-$HOME/Documents/.terminal}"
+STATUS="$ROOT/var/lib/dpkg/status"
+INFO="$ROOT/var/lib/dpkg/info"
+FORCE_ARCH=0
+
+usage() {
+    printf '%s\n' "Usage: dpkg <action>"
+    printf '%s\n' ""
+    printf '%s\n' "  -i, --install <file.deb>    Install a Terminal-compatible .deb"
+    printf '%s\n' "  -r, --remove <package>      Remove a package"
+    printf '%s\n' "  -P, --purge <package>       Remove a package (same as -r here)"
+    printf '%s\n' "  -l, --list                  List installed packages"
+    printf '%s\n' "  -s, --status <package>      Show package status"
+    printf '%s\n' "  -L, --listfiles <package>   List files installed by a package"
+    printf '%s\n' "  -x, --extract <deb> <dir>   Extract a .deb data archive"
+    printf '%s\n' "  --contents <deb>            List the contents of a .deb"
+    printf '%s\n' "  --print-architecture        Print the native architecture"
+    printf '%s\n' "  --force-architecture        Allow non-native architecture packages"
+    printf '%s\n' "  --version                   Show version"
+}
+ensure() {
+    mkdir -p "$ROOT" "$INFO" "$ROOT/tmp" "$ROOT/var/lib/dpkg"
+    [ -f "$STATUS" ] || : > "$STATUS"
+}
+
+field() {
+    key="$1"; file="$2"
+    awk -v key="$key" 'index($0,key": ")==1 { sub("^" key ": ",""); print; exit }' "$file"
+}
+
+stanza_field() {
+    key="$1"; stanza="$2"
+    printf '%s\n' "$stanza" | awk -v key="$key" 'index($0,key": ")==1 { sub("^" key ": ",""); print; exit }'
+}
+
+stanza_for() {
+    pkg="$1"
+    awk -v pkg="$pkg" 'BEGIN{RS=""; ORS="\n\n"} $0 ~ "(^|\\n)Package: " pkg "(\\n|$)" { print; exit }' "$STATUS"
+}
+
+remove_status() {
+    pkg="$1"
+    TMP="$ROOT/tmp/status.$$"
+    awk -v pkg="$pkg" 'BEGIN{RS=""; ORS="\n\n"} $0 !~ "(^|\\n)Package: " pkg "(\\n|$)" { print }' "$STATUS" > "$TMP"
+    mv "$TMP" "$STATUS"
+}
+
+append_status() {
+    {
+        echo "Package: $PKG"
+        echo "Status: install ok installed"
+        echo "Priority: ${PRIORITY:-optional}"
+        echo "Section: ${SECTION:-plugins}"
+        echo "Installed-Size: ${INSTALLED_SIZE:-0}"
+        echo "Maintainer: ${MAINTAINER:-unknown}"
+        echo "Architecture: ${ARCH:-iphoneos-arm64}"
+        echo "Version: $VERSION"
+        echo "Description: $DESCRIPTION"
+        echo ""
+    } >> "$STATUS"
+}
+
+ar_extract() {
+    archive="$1"
+    dest="$2"
+    tar -xf "$archive" -C "$dest" >/dev/null 2>&1
+    if [ ! -f "$dest/debian-binary" ]; then
+        if python3 -c 'pass' >/dev/null 2>&1 && [ -f "$APPDIR/bin/ardeb" ]; then
+            python3 "$APPDIR/bin/ardeb" extract "$archive" "$dest"
+        fi
+    fi
+}
+
+install_deb() {
+    DEB="$1"
+    if [ ! -f "$DEB" ]; then
+        echo "dpkg: cannot access archive '$DEB': No such file" >&2
+        return 1
+    fi
+    if python3 -c 'pass' >/dev/null 2>&1 && [ -f "$APPDIR/bin/pkgtool" ]; then
+        python3 "$APPDIR/bin/pkgtool" install "$DEB"
+        return $?
+    fi
+    ensure
+    echo "dpkg: unpacking $DEB"
+    TMP="$ROOT/tmp/dpkg.$$"
+    rm -rf "$TMP"
+    mkdir -p "$TMP"
+    cp "$DEB" "$TMP/pkg.deb" || { rm -rf "$TMP"; return 1; }
+    ar_extract "$TMP/pkg.deb" "$TMP"
+    echo "dpkg: ar extracted"
+    if [ ! -f "$TMP/debian-binary" ]; then
+        echo "dpkg: '$DEB' is not a Debian-format archive" >&2
+        rm -rf "$TMP"
+        return 1
+    fi
+
+    CTRL_ARCHIVE=""
+    for f in "$TMP"/control.tar.*; do [ -f "$f" ] && { CTRL_ARCHIVE="$f"; break; }; done
+    DATA_ARCHIVE=""
+    for f in "$TMP"/data.tar.*; do [ -f "$f" ] && { DATA_ARCHIVE="$f"; break; }; done
+    if [ -z "$CTRL_ARCHIVE" ] || [ -z "$DATA_ARCHIVE" ]; then
+        echo "dpkg: missing control or data archive" >&2
+        rm -rf "$TMP"
+        return 1
+    fi
+
+    mkdir -p "$TMP/control"
+    case "$CTRL_ARCHIVE" in
+        *.gz) tar -xzf "$CTRL_ARCHIVE" -C "$TMP/control" 2>/dev/null ;;
+        *.xz) tar -xJf "$CTRL_ARCHIVE" -C "$TMP/control" 2>/dev/null ;;
+        *)    tar -xf "$CTRL_ARCHIVE" -C "$TMP/control" 2>/dev/null ;;
+    esac
+    CONTROL=""
+    if [ -f "$TMP/control/control" ]; then
+        CONTROL="$TMP/control/control"
+    elif [ -f "$TMP/control/DEBIAN/control" ]; then
+        CONTROL="$TMP/control/DEBIAN/control"
+    fi
+    if [ -z "$CONTROL" ]; then
+        echo "dpkg: no control file in package" >&2
+        rm -rf "$TMP"
+        return 1
+    fi
+
+    PKG=$(field Package "$CONTROL")
+    VERSION=$(field Version "$CONTROL")
+    ARCH=$(field Architecture "$CONTROL")
+    PRIORITY=$(field Priority "$CONTROL")
+    SECTION=$(field Section "$CONTROL")
+    MAINTAINER=$(field Maintainer "$CONTROL")
+    DESCRIPTION=$(field Description "$CONTROL")
+    [ -n "$PKG" ] && [ -n "$VERSION" ] || {
+        echo "dpkg: invalid control file (Package/Version missing)" >&2
+        rm -rf "$TMP"
+        return 1
+    }
+    case "$PKG" in
+        *[!A-Za-z0-9+.-]*|"") echo "dpkg: invalid package name: $PKG" >&2; rm -rf "$TMP"; return 1 ;;
+    esac
+
+    case "$ARCH" in
+        ""|all|iphoneos-arm64|darwin-arm64|a-shell) ;;
+        *)
+            if [ "$FORCE_ARCH" != "1" ]; then
+                echo "dpkg: architecture '$ARCH' is not native to iOS/Terminal." >&2
+                echo "      Debian Linux binaries cannot run without an emulator." >&2
+                echo "      Use --force-architecture only for script-only packages." >&2
+                rm -rf "$TMP"
+                return 1
+            fi
+            echo "dpkg: warning: forcing architecture '$ARCH'" >&2
+            ;;
+    esac
+
+    echo "Selecting previously unselected package $PKG."
+    echo "Unpacking $PKG ($VERSION) ..."
+
+    if [ -f "$TMP/control/preinst" ]; then
+        TERM_ROOT="$ROOT" PREFIX="$ROOT" sh "$TMP/control/preinst" install || {
+            echo "dpkg: preinst script failed" >&2
+            rm -rf "$TMP"
+            return 1
+        }
+    fi
+
+    echo "dpkg: extracting data archive..."
+    case "$DATA_ARCHIVE" in
+        *.gz) tar -tzf "$DATA_ARCHIVE" 2>/dev/null > "$TMP/filelist" ;;
+        *.xz) tar -tJf "$DATA_ARCHIVE" 2>/dev/null > "$TMP/filelist" ;;
+        *)    tar -tf "$DATA_ARCHIVE" 2>/dev/null > "$TMP/filelist" ;;
+    esac
+    awk '{ sub(/^\.\//,""); if ($0 != "") print }' "$TMP/filelist" > "$INFO/$PKG.list"
+    DATA_OK=0
+    case "$DATA_ARCHIVE" in
+        *.gz) tar -xzf "$DATA_ARCHIVE" -C "$ROOT" --no-same-owner 2>/dev/null && DATA_OK=1 ;;
+        *.xz) tar -xJf "$DATA_ARCHIVE" -C "$ROOT" --no-same-owner 2>/dev/null && DATA_OK=1 ;;
+        *)    tar -xf "$DATA_ARCHIVE" -C "$ROOT" --no-same-owner 2>/dev/null && DATA_OK=1 ;;
+    esac
+    if [ $DATA_OK -ne 1 ]; then
+        case "$DATA_ARCHIVE" in
+            *.gz) tar -xzf "$DATA_ARCHIVE" -C "$ROOT" 2>/dev/null && DATA_OK=1 ;;
+            *.xz) tar -xJf "$DATA_ARCHIVE" -C "$ROOT" 2>/dev/null && DATA_OK=1 ;;
+            *)    tar -xf "$DATA_ARCHIVE" -C "$ROOT" 2>/dev/null && DATA_OK=1 ;;
+        esac
+    fi
+    if [ $DATA_OK -ne 1 ]; then
+        echo "dpkg: failed to extract data archive" >&2
+        rm -rf "$TMP"
+        return 1
+    fi
+
+    # Warn about native Mach-O payloads: a-Shell cannot execute them.
+    if [ -f "$INFO/$PKG.list" ]; then
+        for f in $(cat "$INFO/$PKG.list"); do
+            case "$f" in
+                bin/*|sbin/*|usr/bin/*|usr/sbin/*|usr/libexec/*)
+                    if file "$ROOT/$f" 2>/dev/null | grep -q 'Mach-O'; then
+                        echo "dpkg: note: $f is a native Mach-O executable; a-Shell cannot run it." >&2
+                    fi
+                    ;;
+            esac
+        done
+    fi
+
+    remove_status "$PKG"
+    INSTALLED_SIZE=$(du -sk "$ROOT" 2>/dev/null)
+    INSTALLED_SIZE=${INSTALLED_SIZE%%[!0-9]*}
+    append_status
+
+    for script in preinst postinst prerm postrm; do
+        if [ -f "$TMP/control/$script" ]; then
+            cp "$TMP/control/$script" "$INFO/$PKG.$script"
+            chmod +x "$INFO/$PKG.$script"
+        fi
+    done
+
+    if [ -f "$TMP/control/postinst" ]; then
+        TERM_ROOT="$ROOT" PREFIX="$ROOT" sh "$TMP/control/postinst" configure || {
+            echo "dpkg: postinst script failed" >&2
+            rm -rf "$TMP"
+            return 1
+        }
+    fi
+
+    echo "Setting up $PKG ($VERSION) ..."
+    rm -rf "$TMP"
+    return 0
+}
+
+remove_pkg() {
+    PKG="$1"
+    [ -n "$PKG" ] || { usage; return 2; }
+    ensure
+    STANZA=$(stanza_for "$PKG")
+    if [ -z "$STANZA" ]; then
+        echo "dpkg: package '$PKG' is not installed" >&2
+        return 1
+    fi
+    if [ -f "$INFO/$PKG.prerm" ]; then
+        ( TERM_ROOT="$ROOT" PREFIX="$ROOT" sh "$INFO/$PKG.prerm" remove ) || true
+    fi
+    if [ -f "$INFO/$PKG.list" ]; then
+        for f in $(cat "$INFO/$PKG.list"); do
+            case "$f" in
+                ""|/*|../*|*/../*) continue ;;
+            esac
+            [ -d "$ROOT/$f" ] && continue
+            rm -f "$ROOT/$f"
+        done
+    fi
+    if [ -f "$INFO/$PKG.postrm" ]; then
+        ( TERM_ROOT="$ROOT" PREFIX="$ROOT" sh "$INFO/$PKG.postrm" remove ) || true
+    fi
+    remove_status "$PKG"
+    rm -f "$INFO/$PKG.list" "$INFO/$PKG.preinst" "$INFO/$PKG.postinst" \
+          "$INFO/$PKG.prerm" "$INFO/$PKG.postrm"
+    echo "Removing $PKG ..."
+    echo "Purging configuration files for $PKG ..."
+    return 0
+}
+
+list_packages() {
+    ensure
+    echo "Desired=Unknown/Install/Remove/Purge/Hold"
+    echo "| Status=Not/Inst/Conf-files/Unpacked/halF-conf/Half-inst/trig-aWait/Trig-pend"
+    echo "|/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)"
+    echo "||/ Name                 Version          Architecture     Description"
+    echo "+++-====================-================-================-================================="
+    awk 'BEGIN{RS="";FS="\n"} {
+        p="";v="";a="";d="";s="";
+        for (i=1;i<=NF;i++) {
+            if ($i ~ /^Package: /) p=substr($i,10);
+            if ($i ~ /^Version: /) v=substr($i,10);
+            if ($i ~ /^Architecture: /) a=substr($i,14);
+            if ($i ~ /^Description: /) d=substr($i,14);
+            if ($i ~ /^Status: /) s=substr($i,9);
+        }
+        if (s ~ /installed/) printf "ii  %-20s %-16s %-16s %s\n", p, v, a, d;
+    }' "$STATUS"
+}
+
+status_pkg() {
+    PKG="$1"
+    STANZA=$(stanza_for "$PKG")
+    if [ -z "$STANZA" ]; then
+        echo "dpkg-query: package '$PKG' is not installed" >&2
+        return 1
+    fi
+    printf '%s\n' "$STANZA"
+}
+
+list_files() {
+    PKG="$1"
+    if [ ! -f "$INFO/$PKG.list" ]; then
+        echo "dpkg-query: package '$PKG' is not installed" >&2
+        return 1
+    fi
+    sed "s#^#/#" "$INFO/$PKG.list"
+}
+
+extract_deb() {
+    DEB="$1"; DEST="$2"
+    [ -f "$DEB" ] || { echo "dpkg: cannot access '$DEB'" >&2; return 1; }
+    [ -n "$DEST" ] || { usage; return 2; }
+    TMP="$ROOT/tmp/dpkg-x.$$"
+    rm -rf "$TMP"; mkdir -p "$TMP" "$DEST"
+    cp "$DEB" "$TMP/pkg.deb"
+    ar_extract "$TMP/pkg.deb" "$TMP"
+    DATA=""
+    for f in "$TMP"/data.tar.*; do [ -f "$f" ] && { DATA="$f"; break; }; done
+    [ -n "$DATA" ] || { echo "dpkg: no data archive" >&2; rm -rf "$TMP"; return 1; }
+    tar -xf "$DATA" -C "$DEST" --no-same-owner 2>/dev/null || tar -xf "$DATA" -C "$DEST" 2>/dev/null
+    rm -rf "$TMP"
+}
+
+contents_deb() {
+    DEB="$1"
+    [ -f "$DEB" ] || { echo "dpkg: cannot access '$DEB'" >&2; return 1; }
+    TMP="$ROOT/tmp/dpkg-c.$$"
+    rm -rf "$TMP"; mkdir -p "$TMP"
+    cp "$DEB" "$TMP/pkg.deb"
+    ar_extract "$TMP/pkg.deb" "$TMP"
+    DATA=""
+    for f in "$TMP"/data.tar.*; do [ -f "$f" ] && { DATA="$f"; break; }; done
+    [ -n "$DATA" ] || { echo "dpkg: no data archive" >&2; rm -rf "$TMP"; return 1; }
+    case "$DATA" in
+        *.gz) tar -tzf "$DATA" 2>/dev/null > "$TMP/contents" ;;
+        *.xz) tar -tJf "$DATA" 2>/dev/null > "$TMP/contents" ;;
+        *)    tar -tf "$DATA" 2>/dev/null > "$TMP/contents" ;;
+    esac
+    awk '{ sub(/^\.\//,""); if ($0 != "") print }' "$TMP/contents"
+    rm -rf "$TMP"
+}
+
+case "${1:-}" in
+    -i|--install)
+        shift
+        if [ "${1:-}" = "--force-architecture" ]; then FORCE_ARCH=1; shift; fi
+        [ -n "${1:-}" ] || { usage; exit 2; }
+        install_deb "$1"
+        ;;
+    -r|--remove|-P|--purge)
+        shift
+        remove_pkg "${1:-}"
+        ;;
+    -l|--list)
+        list_packages
+        ;;
+    -s|--status)
+        shift
+        status_pkg "${1:-}"
+        ;;
+    -L|--listfiles)
+        shift
+        list_files "${1:-}"
+        ;;
+    -x|--extract)
+        shift
+        extract_deb "${1:-}" "${2:-}"
+        ;;
+    --contents)
+        shift
+        contents_deb "${1:-}"
+        ;;
+    --print-architecture)
+        echo "iphoneos-arm64"
+        ;;
+    --force-architecture)
+        FORCE_ARCH=1
+        shift
+        [ -n "${1:-}" ] && install_deb "$1"
+        ;;
+    --version|-V)
+        echo "dpkg 1.0 (Terminal native package manager)"
+        ;;
+    ""|-h|--help|help)
+        usage
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac

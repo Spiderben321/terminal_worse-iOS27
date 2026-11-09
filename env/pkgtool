@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""pkgtool - Python package backend for Terminal's native apt/dpkg.
+
+This avoids a-Shell's shell/tar/ar quirks for package construction and
+extraction.  It is used when Python 3 is available (the full a-Shell app has
+it).  Native Mach-O payloads are installed but flagged as non-runnable.
+"""
+
+import io
+import os
+import shutil
+import sys
+import tarfile
+import tempfile
+
+ROOT = os.environ.get("TERM_ROOT") or os.path.join(os.path.expanduser("~"), "Documents", ".terminal")
+INFO = os.path.join(ROOT, "var", "lib", "dpkg", "info")
+STATUS = os.path.join(ROOT, "var", "lib", "dpkg", "status")
+PACKAGES = os.path.join(ROOT, "repo", "Packages")
+
+
+def ar_pack(out_path, members):
+    with open(out_path, "wb") as out:
+        out.write(b"!<arch>\n")
+        for path in members:
+            data = open(path, "rb").read()
+            name = os.path.basename(path)
+            if len(name) > 15:
+                raise SystemExit("pkgtool: ar member name too long: " + name)
+            header = (
+                name.ljust(16) + "0".ljust(12) + "0".ljust(6) + "0".ljust(6)
+                + "100644".ljust(8) + str(len(data)).ljust(10) + "`\n"
+            ).encode("ascii")
+            out.write(header)
+            out.write(data)
+            if len(data) & 1:
+                out.write(b"\n")
+
+
+def ar_unpack(archive, dest):
+    data = open(archive, "rb").read()
+    if not data.startswith(b"!<arch>\n"):
+        raise SystemExit("pkgtool: not a Debian ar archive")
+    pos = 8
+    while pos + 60 <= len(data):
+        header = data[pos:pos + 60]
+        pos += 60
+        name = header[:16].decode("ascii", "ignore").strip().rstrip("/")
+        if not name:
+            continue
+        try:
+            size = int(header[48:58].decode("ascii", "ignore").strip() or "0")
+        except ValueError:
+            size = 0
+        body = data[pos:pos + size]
+        pos += size + (size & 1)
+        if name in (".", ".."):
+            continue
+        open(os.path.join(dest, name), "wb").write(body)
+
+
+def safe_extract(tar_path, dest):
+    os.makedirs(dest, exist_ok=True)
+    with tarfile.open(tar_path, "r:*") as tar:
+        for member in tar.getmembers():
+            name = member.name.lstrip("./")
+            if not name or name.startswith("/") or ".." in name.split("/"):
+                continue
+            target = os.path.join(dest, name)
+            if member.isdir():
+                os.makedirs(target, exist_ok=True)
+            elif member.isfile():
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                src = tar.extractfile(member)
+                if src is None:
+                    continue
+                with open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.chmod(target, member.mode & 0o777)
+            elif member.issym():
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                # Symlinks are installed relative to the package root.
+                try:
+                    os.symlink(member.linkname, target)
+                except FileExistsError:
+                    os.unlink(target)
+                    os.symlink(member.linkname, target)
+
+
+def parse_control(control_path):
+    fields = {}
+    with open(control_path, "r", errors="replace") as f:
+        for line in f:
+            if line.startswith(" ") or line.startswith("\t"):
+                continue
+            if ":" in line:
+                k, v = line.split(":", 1)
+                fields[k.strip()] = v.strip()
+    return fields
+
+
+def append_packages(fields, filename):
+    os.makedirs(os.path.dirname(PACKAGES), exist_ok=True)
+    with open(PACKAGES, "a") as f:
+        f.write("Package: %s\n" % fields.get("Package", ""))
+        f.write("Version: %s\n" % fields.get("Version", ""))
+        f.write("Architecture: %s\n" % fields.get("Architecture", "iphoneos-arm64"))
+        f.write("Maintainer: %s\n" % fields.get("Maintainer", "unknown"))
+        f.write("Section: %s\n" % fields.get("Section", "plugins"))
+        f.write("Priority: %s\n" % fields.get("Priority", "optional"))
+        f.write("Filename: pool/%s\n" % os.path.basename(filename))
+        f.write("Size: %d\n" % os.path.getsize(filename))
+        if fields.get("Depends"):
+            f.write("Depends: %s\n" % fields["Depends"])
+        f.write("Description: %s\n\n" % fields.get("Description", ""))
+
+
+def build(out_path, name, version, arch, payload, depends=""):
+    os.makedirs(os.path.dirname(packages_dir()), exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="mkdeb.", dir=os.path.join(ROOT, "tmp"))
+    try:
+        control_dir = os.path.join(tmp, "DEBIAN")
+        os.makedirs(control_dir, exist_ok=True)
+        control = (
+            "Package: %s\nVersion: %s\nArchitecture: %s\n"
+            "Maintainer: %s\nSection: plugins\nPriority: optional\n"
+            "Description: %s\n"
+            % (name, version, arch,
+               os.environ.get("MKDEB_MAINTAINER", "Terminal User <mobile@localhost>"),
+               os.environ.get("MKDEB_DESCRIPTION", name + " plugin for Terminal"))
+        )
+        if depends:
+            control += "Depends: %s\n" % depends
+        open(os.path.join(control_dir, "control"), "w").write(control)
+
+        payload_debian = os.path.join(payload, "DEBIAN")
+        if os.path.isdir(payload_debian):
+            for script in ("preinst", "postinst", "prerm", "postrm"):
+                src = os.path.join(payload_debian, script)
+                if os.path.isfile(src):
+                    shutil.copy(src, os.path.join(control_dir, script))
+
+        control_tar = os.path.join(tmp, "control.tar.gz")
+        with tarfile.open(control_tar, "w:gz") as tar:
+            for root, dirs, files in os.walk(control_dir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    arc = os.path.relpath(full, tmp)
+                    tar.add(full, arcname=arc)
+
+        data_tar = os.path.join(tmp, "data.tar.gz")
+        with tarfile.open(data_tar, "w:gz") as tar:
+            for root, dirs, files in os.walk(payload):
+                dirs[:] = [d for d in dirs if not (root == payload and d == "DEBIAN")]
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    arc = os.path.relpath(full, payload)
+                    tar.add(full, arcname="./" + arc)
+        open(os.path.join(tmp, "debian-binary"), "w").write("2.0\n")
+        ar_pack(out_path, [os.path.join(tmp, "debian-binary"), control_tar, data_tar])
+
+        fields = parse_control(os.path.join(control_dir, "control"))
+        append_packages(fields, out_path)
+        print(out_path)
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def packages_dir():
+    return os.path.join(ROOT, "repo", "pool")
+
+
+def install(deb):
+    if not os.path.isfile(deb):
+        print("pkgtool: cannot access archive %s" % deb, file=sys.stderr)
+        return 1
+    os.makedirs(INFO, exist_ok=True)
+    os.makedirs(os.path.dirname(STATUS), exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="dpkg.", dir=os.path.join(ROOT, "tmp"))
+    try:
+        ar_unpack(deb, tmp)
+        control_tar = data_tar = None
+        for fn in os.listdir(tmp):
+            if fn.startswith("control.tar"):
+                control_tar = os.path.join(tmp, fn)
+            elif fn.startswith("data.tar"):
+                data_tar = os.path.join(tmp, fn)
+        if not control_tar or not data_tar:
+            print("pkgtool: missing control or data archive", file=sys.stderr)
+            return 1
+        control_dir = os.path.join(tmp, "control")
+        safe_extract(control_tar, control_dir)
+        control_path = os.path.join(control_dir, "control")
+        if not os.path.isfile(control_path):
+            control_path = os.path.join(control_dir, "DEBIAN", "control")
+        if not os.path.isfile(control_path):
+            print("pkgtool: control file not found", file=sys.stderr)
+            return 1
+        fields = parse_control(control_path)
+        pkg = fields.get("Package", "")
+        version = fields.get("Version", "")
+        arch = fields.get("Architecture", "iphoneos-arm64")
+        if not pkg or not version:
+            print("pkgtool: invalid control (Package/Version missing)", file=sys.stderr)
+            return 1
+        if arch not in ("", "all", "iphoneos-arm64", "darwin-arm64", "a-shell"):
+            print("pkgtool: architecture '%s' is not native to iOS/Terminal" % arch, file=sys.stderr)
+            print("pkgtool: use the shell dpkg --force-architecture only for script packages", file=sys.stderr)
+            return 1
+
+        print("Selecting previously unselected package %s." % pkg)
+        print("Unpacking %s (%s) ..." % (pkg, version))
+        safe_extract(data_tar, ROOT)
+
+        file_list = []
+        with tarfile.open(data_tar, "r:*") as tar:
+            for member in tar.getmembers():
+                name = member.name.lstrip("./")
+                if name and not name.startswith("/") and ".." not in name.split("/"):
+                    file_list.append(name)
+                    if member.isfile() and any(part in ("bin", "sbin", "libexec") for part in name.split("/")):
+                        full = os.path.join(ROOT, name)
+                        try:
+                            magic = open(full, "rb").read(4)
+                        except OSError:
+                            magic = b""
+                        if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+                            print("pkgtool: note: %s is a native Mach-O binary; a-Shell cannot run it." % name, file=sys.stderr)
+        open(os.path.join(INFO, pkg + ".list"), "w").write("\n".join(file_list) + "\n")
+
+        # Maintainer scripts are kept for inspection/removal, but not executed:
+        # a-Shell has no fork/exec for arbitrary shell children in the Python
+        # backend.  Script-only packages should use dpkg's shell path if needed.
+        for script in ("preinst", "postinst", "prerm", "postrm"):
+            src = os.path.join(control_dir, "DEBIAN", script)
+            if not os.path.isfile(src):
+                src = os.path.join(control_dir, script)
+            if os.path.isfile(src):
+                shutil.copy(src, os.path.join(INFO, pkg + "." + script))
+
+        # Replace the package stanza in the status database.
+        stanzas = []
+        if os.path.isfile(STATUS):
+            with open(STATUS, "r", errors="replace") as f:
+                current = []
+                for line in f:
+                    if line.strip() == "":
+                        if current:
+                            stanzas.append("".join(current))
+                            current = []
+                    else:
+                        current.append(line)
+                if current:
+                    stanzas.append("".join(current))
+        kept = [s for s in stanzas if not s.startswith("Package: %s\n" % pkg)]
+        kept.append(
+            "Package: %s\nStatus: install ok installed\nPriority: %s\nSection: %s\n"
+            "Maintainer: %s\nArchitecture: %s\nVersion: %s\nDescription: %s\n\n"
+            % (pkg, fields.get("Priority", "optional"), fields.get("Section", "plugins"),
+               fields.get("Maintainer", "unknown"), arch, version,
+               fields.get("Description", ""))
+        )
+        open(STATUS, "w").write("\n".join(kept))
+        print("Setting up %s (%s) ..." % (pkg, version))
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    cmd = sys.argv[1]
+    if cmd == "build" and len(sys.argv) >= 7:
+        return build(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6],
+                     sys.argv[7] if len(sys.argv) > 7 else "")
+    if cmd == "install" and len(sys.argv) >= 3:
+        return install(sys.argv[2])
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

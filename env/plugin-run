@@ -1,0 +1,32 @@
+#!/bin/sh
+# plugin-run - run a native Terminal plugin safely.
+# a-Shell's in-process command loader refuses standalone Mach-O binaries;
+# script plugins and WebAssembly plugins can run.  This wrapper gives a clear
+# error instead of "command not found" for native packages.
+
+ROOT="${TERM_ROOT:-$HOME/Documents/.terminal}"
+if [ $# -eq 0 ]; then
+    echo "usage: plugin-run <command> [args...]" >&2
+    exit 2
+fi
+
+CMD="$1"
+shift
+FOUND=$(which "$CMD" 2>/dev/null)
+if [ -z "$FOUND" ]; then
+    echo "plugin-run: '$CMD' not found in PATH" >&2
+    exit 127
+fi
+
+MAGIC=$(dd if="$FOUND" bs=4 count=1 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')
+case "$MAGIC" in
+    cffaedfe|feedfacf|cafebabe|bebafeca)
+        echo "plugin-run: '$CMD' is a native Mach-O executable." >&2
+        echo "a-Shell does not execute standalone Mach-O binaries in its sandbox." >&2
+        echo "Native Procursus/Havoc CLI packages require a jailbreak or a Linux emulator." >&2
+        echo "Script plugins (#!/bin/sh, python, perl, lua, wasm) can run normally." >&2
+        exit 126
+        ;;
+esac
+
+"$FOUND" "$@"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# apt-get compatibility wrapper for the native Terminal package manager.
+sh "$APPDIR/bin/apt" "$@"
+exit $?

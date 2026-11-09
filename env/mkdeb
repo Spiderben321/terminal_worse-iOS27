@@ -1,0 +1,109 @@
+#!/bin/sh
+# mkdeb - build a Terminal-compatible .deb package and add it to the local repo
+# Usage: mkdeb <name> <version> <payload-dir> [architecture]
+# The payload directory is copied to the prefix root; put files under
+# bin/, usr/bin/, lib/, share/, etc.  Maintainer scripts may be placed in
+# <payload-dir>/DEBIAN/{preinst,postinst,prerm,postrm}.
+
+ROOT="${TERM_ROOT:-$HOME/Documents/.terminal}"
+NAME="${1:-}"
+VERSION="${2:-}"
+PAYLOAD="${3:-}"
+ARCH="${4:-iphoneos-arm64}"
+MAINTAINER="${MKDEB_MAINTAINER:-Terminal User <mobile@localhost>}"
+DESCRIPTION="${MKDEB_DESCRIPTION:-$NAME plugin for Terminal}"
+
+usage() {
+    echo "usage: mkdeb <name> <version> <payload-dir> [architecture]" >&2
+    echo "  architecture: iphoneos-arm64 (default), all, darwin-arm64" >&2
+    exit 2
+}
+
+[ -n "$NAME" ] && [ -n "$VERSION" ] && [ -n "$PAYLOAD" ] || usage
+[ -d "$PAYLOAD" ] || { echo "mkdeb: payload directory not found: $PAYLOAD" >&2; exit 1; }
+case "$NAME" in
+    *[!A-Za-z0-9+.-]*|"") echo "mkdeb: invalid package name: $NAME" >&2; exit 1 ;;
+esac
+
+echo "mkdeb: start $NAME $VERSION"
+mkdir -p "$ROOT/repo/pool" "$ROOT/tmp" "$ROOT/var/lib/dpkg/info"
+DEB="$ROOT/repo/pool/${NAME}_${VERSION}_${ARCH}.deb"
+if python3 -c 'pass' >/dev/null 2>&1 && [ -f "$APPDIR/bin/pkgtool" ]; then
+    MKDEB_MAINTAINER="$MAINTAINER" MKDEB_DESCRIPTION="$DESCRIPTION" \
+        python3 "$APPDIR/bin/pkgtool" build "$DEB" "$NAME" "$VERSION" "$ARCH" "$PAYLOAD" "${MKDEB_DEPENDS:-}"
+    exit $?
+fi
+TMP="$ROOT/tmp/mkdeb.$$"
+rm -rf "$TMP"
+mkdir -p "$TMP/DEBIAN"
+
+# Control file.
+{
+    echo "Package: $NAME"
+    echo "Version: $VERSION"
+    echo "Architecture: $ARCH"
+    echo "Maintainer: $MAINTAINER"
+    echo "Section: plugins"
+    echo "Priority: optional"
+    echo "Description: $DESCRIPTION"
+    [ -n "${MKDEB_DEPENDS:-}" ] && echo "Depends: $MKDEB_DEPENDS"
+} > "$TMP/DEBIAN/control"
+
+# Optional maintainer scripts from the payload's DEBIAN directory.
+for script in preinst postinst prerm postrm; do
+    if [ -f "$PAYLOAD/DEBIAN/$script" ]; then
+        cp "$PAYLOAD/DEBIAN/$script" "$TMP/DEBIAN/$script"
+        chmod +x "$TMP/DEBIAN/$script"
+    fi
+done
+
+# Build the two tar archives.  Copy the payload first (no shell pipeline;
+# nested tar pipelines can stall inside a-Shell's in-process command model).
+DATA_TMP="$TMP/data"
+mkdir -p "$DATA_TMP"
+echo "mkdeb: copying payload..."
+cp -R "$PAYLOAD"/. "$DATA_TMP"/ 2>/dev/null
+rm -rf "$DATA_TMP/DEBIAN"
+echo "mkdeb: writing data archive..."
+tar -czf "$TMP/data.tar.gz" -C "$DATA_TMP" .
+echo "mkdeb: writing control archive..."
+tar -czf "$TMP/control.tar.gz" -C "$TMP" DEBIAN
+printf '2.0\n' > "$TMP/debian-binary"
+
+DEB="$ROOT/repo/pool/${NAME}_${VERSION}_${ARCH}.deb"
+rm -f "$DEB"
+echo "mkdeb: writing ar archive..."
+rm -f "$DEB"
+tar --format=ar -cf "$DEB" -C "$TMP" debian-binary control.tar.gz data.tar.gz >/dev/null 2>&1
+if [ ! -s "$DEB" ]; then
+    echo "mkdeb: tar ar writer unavailable; trying Python fallback..." >&2
+    if python3 -c 'pass' >/dev/null 2>&1 && [ -f "$APPDIR/bin/ardeb" ]; then
+        python3 "$APPDIR/bin/ardeb" pack "$DEB" "$TMP/debian-binary" "$TMP/control.tar.gz" "$TMP/data.tar.gz"
+    fi
+fi
+if [ ! -s "$DEB" ]; then
+    echo "mkdeb: failed to create $DEB" >&2
+    rm -rf "$TMP"
+    exit 1
+fi
+
+# Update Packages: append the new package stanza.
+SIZE=$(wc -c < "$DEB" | tr -d ' ')
+PACKAGES="$ROOT/repo/Packages"
+touch "$PACKAGES"
+{
+    echo "Package: $NAME"
+    echo "Version: $VERSION"
+    echo "Architecture: $ARCH"
+    echo "Maintainer: $MAINTAINER"
+    echo "Section: plugins"
+    echo "Priority: optional"
+    echo "Filename: pool/$(basename "$DEB")"
+    echo "Size: $SIZE"
+    echo "Description: $DESCRIPTION"
+    [ -n "${MKDEB_DEPENDS:-}" ] && echo "Depends: $MKDEB_DEPENDS"
+    echo ""
+} >> "$PACKAGES"
+
+rm -rf "$TMP"
+echo "$DEB"

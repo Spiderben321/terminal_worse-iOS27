@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>application-identifier</key><string>NL6UD7G49R.com.cert.account.t260930000125</string>
+<key>com.apple.developer.team-identifier</key><string>NL6UD7G49R</string>
+<key>com.apple.security.application-groups</key><array>
+<string>group.com.cert.account.t260930000125.01</string>
+<string>group.com.cert.account.t260930000125.02</string>
+<string>group.com.cert.account.t260930000125.03</string>
+<string>group.com.cert.account.t260930000125.04</string>
+<string>group.com.cert.account.t260930000125.05</string>
+</array>
+<key>keychain-access-groups</key><array><string>NL6UD7G49R.*</string></array>
+<key>com.apple.developer.nfc.readersession.formats</key><array><string>TAG</string></array>
+</dict></plist>
