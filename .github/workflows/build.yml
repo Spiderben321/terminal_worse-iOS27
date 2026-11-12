@@ -1,7 +1,7 @@
 name: Build iOS App
 
 on:
-  workflow_dispatch: # Allows you to trigger the build manually from the Actions tab
+  workflow_dispatch: # Allows manual trigger from the Actions tab
 
 jobs:
   build:
@@ -11,12 +11,65 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Dependencies & Build
+      - name: List Repository Contents
+        run: ls -la
+
+      - name: Build and Archive App
         run: |
-          # Check what files are in the repo to run the correct build command
-          ls -la
-          
-          # If it's an Xcode project (.xcodeproj or .xcworkspace), build it:
-          # xcodebuild -list
-          
-          # If it uses Flutter, React Native, or a custom script, add it here.
+          # Find the workspace or project file automatically
+          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" -print -quit)
+          PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" -print -quit)
+
+          if [ -n "$WORKSPACE" ]; then
+            echo "Found workspace: $WORKSPACE"
+            xcodebuild -workspace "$WORKSPACE" \
+                       -scheme "$(basename "$WORKSPACE" .xcworkspace)" \
+                       -sdk iphoneos \
+                       -configuration Release \
+                       -derivedDataPath Build/DerivedData \
+                       archive -archivePath Build/App.xcarchive
+          elif [ -n "$PROJECT" ]; then
+            echo "Found project: $PROJECT"
+            xcodebuild -project "$PROJECT" \
+                       -scheme "$(basename "$PROJECT" .xcodeproj)" \
+                       -sdk iphoneos \
+                       -configuration Release \
+                       -derivedDataPath Build/DerivedData \
+                       archive -archivePath Build/App.xcarchive
+          else
+            echo "Error: No Xcode project or workspace found!"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Export IPA (Unsigned / Simulator or Ad-Hoc)
+        run: |
+          # Creates a basic export options plist for unsigned builds if codesigning isn't configured
+          cat << 'EOF' > ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.1.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>development</string>
+              <key>signingStyle</key>
+              <string>automatic</string>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>compileBitcode</key>
+              <false/>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+                     -archivePath Build/App.xcarchive \
+                     -exportPath Build/Export \
+                     -exportOptionsPlist ExportOptions.plist || echo "Export skipped or requires signing identity"
+        shell: bash
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-output
+          path: Build/
