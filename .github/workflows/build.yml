@@ -11,65 +11,39 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: List Repository Contents
-        run: ls -la
-
-      - name: Build and Archive App
+      - name: Locate and Build Project
         run: |
-          # Find the workspace or project file automatically
-          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" -print -quit)
-          PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" -print -quit)
-
-          if [ -n "$WORKSPACE" ]; then
-            echo "Found workspace: $WORKSPACE"
-            xcodebuild -workspace "$WORKSPACE" \
-                       -scheme "$(basename "$WORKSPACE" .xcworkspace)" \
-                       -sdk iphoneos \
-                       -configuration Release \
-                       -derivedDataPath Build/DerivedData \
-                       archive -archivePath Build/App.xcarchive
-          elif [ -n "$PROJECT" ]; then
-            echo "Found project: $PROJECT"
-            xcodebuild -project "$PROJECT" \
-                       -scheme "$(basename "$PROJECT" .xcodeproj)" \
-                       -sdk iphoneos \
-                       -configuration Release \
-                       -derivedDataPath Build/DerivedData \
-                       archive -archivePath Build/App.xcarchive
-          else
-            echo "Error: No Xcode project or workspace found!"
+          echo "Searching for Xcode workspace or project..."
+          
+          # Find the directory containing the .xcworkspace or .xcodeproj file
+          PROJECT_PATH=$(find . -name "*.xcworkspace" -o -name "*.xcodeproj" -print -quit)
+          
+          if [ -z "$PROJECT_PATH" ]; then
+            echo "Error: No Xcode project or workspace found in the repository!"
             exit 1
           fi
+          
+          # Get the parent directory and file name
+          PROJECT_DIR=$(dirname "$PROJECT_PATH")
+          PROJECT_NAME=$(basename "$PROJECT_PATH")
+          
+          echo "Found project at: $PROJECT_DIR/$PROJECT_NAME"
+          cd "$PROJECT_DIR"
+          
+          # Build depending on whether it's a workspace or project
+          if [[ "$PROJECT_NAME" == *.xcworkspace ]]; then
+            xcodebuild -workspace "$PROJECT_NAME" \
+                       -scheme "$(basename "$PROJECT_NAME" .xcworkspace)" \
+                       -sdk iphoneos \
+                       -configuration Release \
+                       CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+                       build
+          else
+            xcodebuild -project "$PROJECT_NAME" \
+                       -scheme "$(basename "$PROJECT_NAME" .xcodeproj)" \
+                       -sdk iphoneos \
+                       -configuration Release \
+                       CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+                       build
+          >
         shell: bash
-
-      - name: Export IPA (Unsigned / Simulator or Ad-Hoc)
-        run: |
-          # Creates a basic export options plist for unsigned builds if codesigning isn't configured
-          cat << 'EOF' > ExportOptions.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.1.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>method</key>
-              <string>development</string>
-              <key>signingStyle</key>
-              <string>automatic</string>
-              <key>stripSwiftSymbols</key>
-              <true/>
-              <key>compileBitcode</key>
-              <false/>
-          </dict>
-          </plist>
-          EOF
-
-          xcodebuild -exportArchive \
-                     -archivePath Build/App.xcarchive \
-                     -exportPath Build/Export \
-                     -exportOptionsPlist ExportOptions.plist || echo "Export skipped or requires signing identity"
-        shell: bash
-
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-build-output
-          path: Build/
