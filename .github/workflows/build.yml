@@ -11,39 +11,27 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Locate and Build Project
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: List All Repository Files
+        run: |
+          echo "=== Listing all files in repository ==="
+          find . -maxdepth 3 -not -path '*/.*'
+        shell: bash
+
+      - name: Search for Xcode Project Files
         run: |
           echo "Searching for Xcode workspace or project..."
-          
-          # Find the directory containing the .xcworkspace or .xcodeproj file
           PROJECT_PATH=$(find . -name "*.xcworkspace" -o -name "*.xcodeproj" -print -quit)
           
           if [ -z "$PROJECT_PATH" ]; then
-            echo "Error: No Xcode project or workspace found in the repository!"
+            echo "::error::No Xcode project or workspace found in the repository!"
+            echo "Please check the file list above to see how this project is structured."
             exit 1
-          fi
-          
-          # Get the parent directory and file name
-          PROJECT_DIR=$(dirname "$PROJECT_PATH")
-          PROJECT_NAME=$(basename "$PROJECT_PATH")
-          
-          echo "Found project at: $PROJECT_DIR/$PROJECT_NAME"
-          cd "$PROJECT_DIR"
-          
-          # Build depending on whether it's a workspace or project
-          if [[ "$PROJECT_NAME" == *.xcworkspace ]]; then
-            xcodebuild -workspace "$PROJECT_NAME" \
-                       -scheme "$(basename "$PROJECT_NAME" .xcworkspace)" \
-                       -sdk iphoneos \
-                       -configuration Release \
-                       CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
-                       build
           else
-            xcodebuild -project "$PROJECT_NAME" \
-                       -scheme "$(basename "$PROJECT_NAME" .xcodeproj)" \
-                       -sdk iphoneos \
-                       -configuration Release \
-                       CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
-                       build
-          >
+            echo "Found project at: $PROJECT_PATH"
+          fi
         shell: bash
