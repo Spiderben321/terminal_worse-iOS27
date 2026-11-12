@@ -16,28 +16,57 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Make Scripts Executable & Run Build
+      - name: Install Python Dependencies
         run: |
-          echo "=== Executing project build scripts ==="
-          
-          # Ensure all shell scripts have execution permissions
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lief
+        shell: bash
+
+      - name: Run Build and Injection Scripts
+        run: |
+          echo "=== Making scripts executable ==="
           chmod +x scripts/*.sh
           
-          # Run the build dylib script
-          if [ -f "scripts/build_dylib.sh" ]; then
-            echo "Running build_dylib.sh..."
-            ./scripts/build_dylib.sh
+          echo "=== Running build_dylib.sh ==="
+          ./scripts/build_dylib.sh
+          
+          echo "=== Running inject_dylib.py ==="
+          python3 scripts/inject_dylib.py
+          
+          echo "=== Running sign_all.sh ==="
+          ./scripts/sign_all.sh
+        shell: bash
+
+      - name: Package Output into an IPA
+        run: |
+          echo "=== Packaging compiled app into an IPA ==="
+          mkdir -p Payload
+          
+          # Look for any generated .app bundle in common output directories and move it to Payload
+          if [ -d "build" ]; then
+            cp -r build/*.app Payload/ 2>/dev/null || true
           fi
           
-          # Run the injection script if Python is needed
-          if [ -f "scripts/inject_dylib.py" ]; then
-            echo "Running inject_dylib.py..."
-            python3 scripts/inject_dylib.py
+          # Fallback check in case the app bundle is located elsewhere in the workspace
+          if [ -d "out" ]; then
+            cp -r out/*.app Payload/ 2>/dev/null || true
           fi
           
-          # Run the signing script
-          if [ -f "scripts/sign_all.sh" ]; then
-            echo "Running sign_all.sh..."
-            ./scripts/sign_all.sh
+          # Check if the Payload folder successfully received the app bundle
+          if [ -d "Payload" ] && [ "$(ls -A Payload)" ]; then
+            echo "Found app bundle, compressing into app.ipa..."
+            zip -r app.ipa Payload
+            echo "Successfully created app.ipa!"
+          else
+            echo "Error: No .app bundle found inside build or out directories."
+            echo "Listing current directory contents for debugging:"
+            find . -maxdepth 2
+            exit 1
           fi
         shell: bash
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TerminalWorse-IPA
+          path: app.ipa
