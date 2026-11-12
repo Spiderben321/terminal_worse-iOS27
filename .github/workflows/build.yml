@@ -1,7 +1,13 @@
-name: Build iOS App
+name: Build and Inject IPA
 
 on:
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'Direct download URL to the base IPA file'
+        required: true
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -22,51 +28,40 @@ jobs:
           python3 -m pip install lief
         shell: bash
 
-      - name: Run Build and Injection Scripts
+      - name: Download Base IPA from Link
         run: |
-          echo "=== Making scripts executable ==="
-          chmod +x scripts/*.sh
+          echo "Downloading base IPA from provided URL..."
+          curl -L -o base.ipa "${{ github.event.inputs.ipa_url }}"
           
-          echo "=== Running build_dylib.sh ==="
-          ./scripts/build_dylib.sh
-          
-          echo "=== Running inject_dylib.py ==="
-          python3 scripts/inject_dylib.py
-          
-          echo "=== Running sign_all.sh ==="
-          ./scripts/sign_all.sh
-        shell: bash
-
-      - name: Package Output into an IPA
-        run: |
-          echo "=== Packaging compiled app into an IPA ==="
-          mkdir -p Payload
-          
-          # Look for any generated .app bundle in common output directories and move it to Payload
-          if [ -d "build" ]; then
-            cp -r build/*.app Payload/ 2>/dev/null || true
-          fi
-          
-          # Fallback check in case the app bundle is located elsewhere in the workspace
-          if [ -d "out" ]; then
-            cp -r out/*.app Payload/ 2>/dev/null || true
-          fi
-          
-          # Check if the Payload folder successfully received the app bundle
-          if [ -d "Payload" ] && [ "$(ls -A Payload)" ]; then
-            echo "Found app bundle, compressing into app.ipa..."
-            zip -r app.ipa Payload
-            echo "Successfully created app.ipa!"
+          # Verify the download succeeded
+          if [ -f "base.ipa" ] && [ -s "base.ipa" ]; then
+            echo "Successfully downloaded base.ipa!"
           else
-            echo "Error: No .app bundle found inside build or out directories."
-            echo "Listing current directory contents for debugging:"
-            find . -maxdepth 2
+            echo "Error: Failed to download a valid file from the provided URL."
             exit 1
           fi
         shell: bash
 
-      - name: Upload IPA Artifact
+      - name: Run Build, Injection, and Signing Scripts
+        run: |
+          echo "=== Making scripts executable ==="
+          chmod +x scripts/*.sh
+          
+          echo "=== 1. Building the dylib ==="
+          ./scripts/build_dylib.sh
+          
+          echo "=== 2. Injecting dylib into the base IPA ==="
+          python3 scripts/inject_dylib.py
+          
+          echo "=== 3. Signing the package ==="
+          ./scripts/sign_all.sh
+        shell: bash
+
+      - name: Upload Final IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TerminalWorse-IPA
-          path: app.ipa
+          name: Modified-Terminal-IPA
+          path: |
+            *.ipa
+            build/*.ipa
+            out/*.ipa
