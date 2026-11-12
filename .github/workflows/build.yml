@@ -1,0 +1,22 @@
+name: Build iOS App
+
+on:
+  workflow_dispatch: # Allows you to trigger the build manually from the Actions tab
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies & Build
+        run: |
+          # Check what files are in the repo to run the correct build command
+          ls -la
+          
+          # If it's an Xcode project (.xcodeproj or .xcworkspace), build it:
+          # xcodebuild -list
+          
+          # If it uses Flutter, React Native, or a custom script, add it here.
