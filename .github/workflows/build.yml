@@ -1,18 +1,43 @@
-name: Inspect Repository
+name: Build iOS App
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual trigger from the Actions tab
 
 jobs:
-    inspect:
-      runs-on: macos-latest
+  build:
+    runs-on: macos-latest
 
-      steps:
-        - name: Checkout Repository
-          uses: actions/checkout@v4
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-        - name: List All Files in Repository
-          run: |
-            echo "=== DIRECTORY STRUCTURE ==="
-            find . -maxdepth 3 -not -path '*/.*' | sort
-          shell: bash
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Make Scripts Executable & Run Build
+        run: |
+          echo "=== Executing project build scripts ==="
+          
+          # Ensure all shell scripts have execution permissions
+          chmod +x scripts/*.sh
+          
+          # Run the build dylib script
+          if [ -f "scripts/build_dylib.sh" ]; then
+            echo "Running build_dylib.sh..."
+            ./scripts/build_dylib.sh
+          fi
+          
+          # Run the injection script if Python is needed
+          if [ -f "scripts/inject_dylib.py" ]; then
+            echo "Running inject_dylib.py..."
+            python3 scripts/inject_dylib.py
+          fi
+          
+          # Run the signing script
+          if [ -f "scripts/sign_all.sh" ]; then
+            echo "Running sign_all.sh..."
+            ./scripts/sign_all.sh
+          fi
+        shell: bash
